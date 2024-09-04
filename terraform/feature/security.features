@@ -1,0 +1,22 @@
+Feature: Security group configurations
+
+Scenario: Verify security group port configurations
+  Given I have a security group with the following configuration
+    | port | protocol |
+    | 80   | tcp      |
+  Then it should have port 80 open
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
