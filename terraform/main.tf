@@ -1,262 +1,166 @@
-terraform {
-  required_providers {
-    google = {
-      source = "hashicorp/google"
-      version = "4.51.0"
+# Create and configure project along with associated resources
+module "project-factory" {
+  source  = "terraform-google-modules/project-factory/google"
+  version = "17.0.0" # Check for the latest version
+
+  name                = var.project_name
+  project_id          = var.project_id
+  billing_account     = var.billing_account
+  activate_apis       = var.activate_apis
+  bucket_name         = var.bucket_name
+  bucket_location     = var.bucket_location
+  bucket_versioning   = true
+  bucket_force_destroy = true
+  default_service_account = "keep"
+  disable_services_on_destroy = true
+
+}
+
+
+# Create VPC, subnets, Cloud Router, and Cloud NAT 
+module "network" {
+  source       = "terraform-google-modules/network/google"
+  version      = "9.3.0"
+
+  network_name = var.network_name
+  project_id   = var.project_id
+
+  # Define subnets: one private and one public
+  subnets = [
+    {
+      subnet_name           = "private_subnet"
+      subnet_ip             = "10.0.1.0/24"
+      subnet_region         = var.region
+      subnet_private_access = true
+    },
+    {
+      subnet_name   = "public_subnet"
+      subnet_ip     = "10.0.2.0/24"
+      subnet_region = var.region
     }
-  }
-}
+  ]
 
-variable "project_id" {
-  description = "project id"
-}
+  secondary_ranges = {
+        private_subnet = [
+            {
+                range_name    = "private_subnet_secondary_01"
+                ip_cidr_range = var.ip_range_pods #"10.1.0.0/24"
+            },
+            {
+                range_name    = "private_subnet_secondary_02"
+                ip_cidr_range = var.ip_range_services #"10.2.0.0/24"
+            },
+        ]
 
-variable "region" {
-  description = "region"
-}
-
-variable "credentials_file" {
-    description = "Path to the service account key JSON file"
-    type        = string
-    default     = ""
-}
-provider "google" {
-  project = var.project_id
-  region  = var.region
-  credentials = file(var.credentials_file)
-}
-
-# Enable necessary APIs
-resource "google_project_service" "project" {
-  for_each = toset([
-    "container.googleapis.com",  # GKE API
-    "compute.googleapis.com",    # Compute API for VPC and NAT
-  ])
-  project = var.project_id
-  service = each.key
-}
-
-
-
-# Create a VPC
-resource "google_compute_network" "vpc" {
-  name                    = "${var.project_id}-vpc"
-  auto_create_subnetworks = "false"
-}
-
-# Create Subnet
-resource "google_compute_subnetwork" "subnet" {
-  name          = "${var.project_id}-subnet"
-  region        = var.region
-  network       = google_compute_network.vpc.name
-  ip_cidr_range = "10.10.0.0/24"
-}
-
-
-# Create GKE cluster
-data "google_container_engine_versions" "gke_version" {
-  location = var.region
-  version_prefix = "1.27."
-}
-
-resource "google_container_cluster" "primary" {
-  name     = "${var.project_id}-gke"
-  location = var.region
-  remove_default_node_pool = true
-  initial_node_count       = 1
-
-  network    = google_compute_network.vpc.name
-  subnetwork = google_compute_subnetwork.subnet.name
-}
-
-# Separately Managed Node Pool
-resource "google_container_node_pool" "primary_nodes" {
-  name       = google_container_cluster.primary.name
-  location   = var.region
-  cluster    = google_container_cluster.primary.name
-  
-  version = data.google_container_engine_versions.gke_version.release_channel_latest_version["STABLE"]
-  node_count = 1
-
-  node_config {
-    oauth_scopes = [
-      "https://www.googleapis.com/auth/logging.write",
-      "https://www.googleapis.com/auth/monitoring",
-    ]
-
-    labels = {
-      env = var.project_id
+        
     }
 
-    machine_type = "e2-medium"
-    tags         = ["gke-node", "${var.project_id}-gke"]
-    metadata = {
-      disable-legacy-endpoints = "true"
+  # Configure Cloud Router and NAT 
+  routes = [
+    {
+      name                   = "nat-router"
+      description            = "route through IGW to access internet"
+      destination_range      = "0.0.0.0/0"
+      #tags                  = "egress-inet"
+      next_hop_internet      = "true"
     }
-    
-    # Set disk size (in GB)
-    disk_size_gb = 30  # Reduce this to stay within your quota
-  }
-}
+  ]
 
-
-# NAT gateway
-
-resource "google_compute_instance" "nat_gateway" {
-    name         = "nat-gateway"
-    machine_type = "e2-medium" 
-    zone         =  "us-central1-b"
-
-    network_interface {
-        subnetwork = google_compute_subnetwork.subnet.id
-        access_config {
-            nat_ip = google_compute_address.nat_ip.address
-        }
+  # Ingress rules to allow traffic from LoadBalancer to GKE nodes
+  ingress_rules = [
+    {
+      name = "allow-loadbalancer-to-nodes"
+      ports = ["80"]  # application's port
+      source_ranges = ["0.0.0.0/0"]  # Restrict this to the LoadBalancer IP range for security
+      #target_tags = ["gke-node"]  # Make sure this tag matches your GKE node's tags
     }
+  ]
+}
 
-    boot_disk {
-      initialize_params {
-        image = "ubuntu-os-cloud/ubuntu-2004-lts"
+# create cluster
+module "kubernetes-engine" {
+  source           = "terraform-google-modules/kubernetes-engine/google"
+  version          = "34.0.0"
+
+  project_id       = var.project_id
+  name             = var.cluster_name
+  region           = var.region
+  network          = var.network_name
+  subnetwork       = "private_subnet"
+  ip_range_pods    = var.ip_range_pods
+  ip_range_services = var.ip_range_services
+
+  # Node pool settings
+  node_pools = [
+    {
+      name           = "default-node-pool"
+      machine_type   = "e2-medium"
+      min_count      = 1
+      max_count      = 3
+      disk_size_gb   = 100
+      auto_upgrade   = true
+      auto_repair    = true
+      service_account = "my-node-pool-sa@${var.project_id}.iam.gserviceaccount.com"
     }
-  }
-
-    
-}
-# Additional firewall rules for ingress/egress traffic as needed
-
-resource "google_compute_address" "nat_ip" {
-    name = "nat-ip"
-    region = google_compute_subnetwork.subnet.region
+  ]
 }
 
-resource "google_compute_router" "nat_router" {
-  name     = "nat-router"
-  network = google_compute_network.vpc.name
-  region  = var.region
-}
+# Kubernetes resource
+resource "kubernetes_deployment" "my_api" {
+  depends_on = [module.kubernetes-engine]
 
-resource "google_compute_router_nat" "nat_config" {
-  name                 = "nat-config"
-  router               = google_compute_router.nat_router.name
-  region               = var.region
-  nat_ip_allocate_option = "AUTO_ONLY"
-
-  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
-  
-  
-}
-
-
-# IAM Role for GKE Cluster 
-resource "google_project_iam_binding" "gke_cluster_role" {
-  project = var.project_id
-  role    = "roles/container.clusterAdmin"
-  members = ["user:azeematjumoke@gmail.com"]
-}
-
-# IAM Role for Service Account 
-resource "google_project_iam_binding" "gke_sa_role" {
-  project = var.project_id
-  role    = "roles/container.developer"
-  members = ["serviceAccount:api-deployment-28@gleaming-medium-434407-d8.iam.gserviceaccount.com"]
-}
-
-# Firewall Rules
-resource "google_compute_firewall" "gke_firewall" {
-  name    = "gke-firewall"
-  network = google_compute_network.vpc.name
-
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "443", "5000"]
-  }
-
-  source_ranges = ["0.0.0.0/0"]
-}
-
-
-# Kubernetes Provider Configuration 
-provider "kubernetes" {
-  host                   = google_container_cluster.primary.endpoint
-  client_certificate     = google_container_cluster.primary.master_auth.0.client_certificate
-  client_key             = google_container_cluster.primary.master_auth.0.client_key
-  cluster_ca_certificate = base64decode(google_container_cluster.primary.master_auth.0.cluster_ca_certificate)
-}
-
-# Kubernetes Resources
-resource "kubernetes_namespace" "demo_ns" {
   metadata {
-    name = "api-namespace"
-  }
-}
-
-resource "kubernetes_deployment" "api_deployment" {
-  metadata {
-    name      = "api-deployment"
-    namespace = kubernetes_namespace.demo_ns.metadata[0].name
+    name      = "my-api"
+    namespace = "default"
   }
 
   spec {
     replicas = 2
+
     selector {
       match_labels = {
-        app = "python-api"
+        app = "my-api"
       }
     }
+
     template {
       metadata {
         labels = {
-          app = "python-api"
+          app = "my-api"
         }
       }
+
       spec {
         container {
-          image = "us-east1-docker.pkg.dev/gleaming-medium-434407-d8/api-deployment-repo/my-python-api:v2"
-          name  = "api-container"
+          name  = "my-api"
+          image = "us-central1-docker.pkg.dev/cloudwings-439409/new-repo/new-image:latest" # Replace with your actual image
+
           port {
-            container_port = 5000
+            container_port = 8080 # Adjust based on your API
           }
-          
         }
       }
     }
   }
+
 }
 
-resource "kubernetes_service" "api_service" {
+resource "kubernetes_service" "my_api_service" {
   metadata {
-    name      = "api-service"
-    namespace = kubernetes_namespace.demo_ns.metadata[0].name
+    name      = "my-api-service"
+    namespace = "default"
   }
+
   spec {
     selector = {
-      app = "python-api"
+      app = kubernetes_deployment.my_api.metadata[0].labels["app"]
     }
-    type = "LoadBalancer"
+
     port {
       port        = 80
-      target_port = 5000
+      target_port = 8080
     }
-  }
-}
 
-resource "kubernetes_ingress" "api_ingress" {
-  metadata {
-    name      = "api-ingress"
-    namespace = kubernetes_namespace.demo_ns.metadata[0].name
-  }
-
-  spec {
-    rule {
-      http {
-        path {
-          path    = "/"
-          backend {
-            service_name = kubernetes_service.api_service.metadata[0].name
-            service_port = 80
-          }
-        }
-      }
-    }
+    type = "LoadBalancer"
   }
 }
